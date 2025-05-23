@@ -1,0 +1,45 @@
+async function handler({ action, userId, planType, stripeSubscriptionId }) {
+  const session = getSession();
+  if (!session?.user?.id) {
+    return { error: "Unauthorized" };
+  }
+
+  if (action === "create") {
+    if (!planType || !stripeSubscriptionId) {
+      return { error: "Missing required fields" };
+    }
+
+    const expiresAt = new Date();
+    expiresAt.setMonth(expiresAt.getMonth() + 1);
+
+    const result = await sql(
+      "INSERT INTO subscriptions (user_id, stripe_subscription_id, status, plan_type, expires_at) VALUES ($1, $2, $3, $4, $5) RETURNING *",
+      [session.user.id, stripeSubscriptionId, "active", planType, expiresAt]
+    );
+
+    return { subscription: result[0] };
+  }
+
+  if (action === "check") {
+    const result = await sql(
+      "SELECT * FROM subscriptions WHERE user_id = $1 AND status = $2 AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
+      [session.user.id, "active"]
+    );
+
+    return {
+      hasActiveSubscription: result.length > 0,
+      subscription: result[0] || null,
+    };
+  }
+
+  if (action === "cancel") {
+    const result = await sql(
+      "UPDATE subscriptions SET status = $1 WHERE user_id = $2 AND stripe_subscription_id = $3 RETURNING *",
+      ["cancelled", session.user.id, stripeSubscriptionId]
+    );
+
+    return { subscription: result[0] };
+  }
+
+  return { error: "Invalid action" };
+}
