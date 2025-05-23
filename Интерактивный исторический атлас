@@ -1,0 +1,523 @@
+"use client";
+import React from "react";
+
+import { useHandleStreamResponse } from "../utilities/runtime-helpers";
+
+function MainComponent() {
+  const [events, setEvents] = useState([]);
+  const [periods, setPeriods] = useState([]);
+  const [selectedPeriod, setSelectedPeriod] = useState(null);
+  const [selectedCategory, setSelectedCategory] = useState(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [aiResponse, setAiResponse] = useState("");
+  const [streamingResponse, setStreamingResponse] = useState("");
+  const [selectedEvent, setSelectedEvent] = useState(null);
+  const [aiSearchResults, setAiSearchResults] = useState(null);
+  const [isSearching, setIsSearching] = useState(false);
+  const [subscription, setSubscription] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [showSubscribeModal, setShowSubscribeModal] = useState(false);
+  const [map, setMap] = useState(null);
+  const [markers, setMarkers] = useState([]);
+  const mapRef = React.useRef(null);
+
+  const handleStreamResponse = useHandleStreamResponse({
+    onChunk: setStreamingResponse,
+    onFinish: (message) => {
+      setAiResponse(message);
+      setStreamingResponse("");
+    },
+  });
+
+  useEffect(() => {
+    const checkSubscription = async () => {
+      try {
+        const response = await fetch("/api/subscription", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "check" }),
+        });
+
+        if (!response.ok) throw new Error("Failed to check subscription");
+
+        const data = await response.json();
+        setSubscription(data.subscription);
+      } catch (err) {
+        console.error("Error checking subscription:", err);
+      }
+    };
+
+    checkSubscription();
+  }, []);
+
+  const handleSubscribe = async () => {
+    setIsProcessing(true);
+    try {
+      const stripe = await loadStripe("your-publishable-key");
+      const response = await fetch(
+        "/integrations/stripe-subscriptions/create-checkout-session",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            priceId: "your-price-id",
+            successUrl: window.location.href,
+            cancelUrl: window.location.href,
+          }),
+        }
+      );
+
+      const session = await response.json();
+      await stripe.redirectToCheckout({
+        sessionId: session.id,
+      });
+    } catch (err) {
+      console.error("Error:", err);
+      setError("Ошибка при оформлении подписки");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  useEffect(() => {
+    const initMap = async () => {
+      if (!subscription?.status === "active") return;
+
+      if (!window.L) {
+        const link = document.createElement("link");
+        link.rel = "stylesheet";
+        link.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+        document.head.appendChild(link);
+
+        await new Promise((resolve) => {
+          const script = document.createElement("script");
+          script.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+          script.onload = resolve;
+          document.head.appendChild(script);
+        });
+      }
+
+      if (mapRef.current && !map) {
+        const newMap = window.L.map(mapRef.current).setView(
+          [55.7558, 37.6173],
+          4
+        );
+        window.L.tileLayer(
+          "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+          {
+            attribution: "© OpenStreetMap contributors",
+          }
+        ).addTo(newMap);
+        setMap(newMap);
+      }
+    };
+
+    initMap();
+
+    return () => {
+      if (map) {
+        map.remove();
+      }
+    };
+  }, [subscription, map]);
+
+  useEffect(() => {
+    if (map && events.length > 0 && subscription?.status === "active") {
+      markers.forEach((marker) => marker.remove());
+      const newMarkers = [];
+
+      events.forEach((event) => {
+        const marker = window.L.marker([event.latitude, event.longitude]).addTo(
+          map
+        ).bindPopup(`
+            <div class="p-2">
+              <h3 class="font-bold text-lg">${event.title}</h3>
+              <p class="text-sm">${event.year} год</p>
+              <p class="text-sm mt-1">${event.description}</p>
+            </div>
+          `);
+
+        marker.on("click", () => {
+          setSelectedEvent(event);
+          getHistoricalInfo(event);
+        });
+
+        newMarkers.push(marker);
+      });
+
+      setMarkers(newMarkers);
+
+      if (newMarkers.length > 0) {
+        const group = window.L.featureGroup(newMarkers);
+        map.fitBounds(group.getBounds().pad(0.1));
+      }
+    }
+  }, [map, events, subscription, markers]);
+
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        const [eventsResponse, periodsResponse] = await Promise.all([
+          fetch("/api/historical-events", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              period: selectedPeriod,
+              category: selectedCategory,
+              search: searchQuery,
+            }),
+          }),
+          fetch("/api/historical-periods", {
+            method: "POST",
+          }),
+        ]);
+
+        if (!eventsResponse.ok || !periodsResponse.ok) {
+          throw new Error("Ошибка при загрузке данных");
+        }
+
+        const [eventsData, periodsData] = await Promise.all([
+          eventsResponse.json(),
+          periodsResponse.json(),
+        ]);
+
+        setEvents(eventsData.events);
+        setPeriods(periodsData.periods);
+      } catch (err) {
+        setError(err.message);
+        console.error("Ошибка:", err);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchData();
+  }, [selectedPeriod, selectedCategory, searchQuery]);
+
+  const getHistoricalInfo = async (event) => {
+    try {
+      const response = await fetch(
+        "/integrations/anthropic-claude-sonnet-3-5/",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: [
+              {
+                role: "system",
+                content:
+                  "Вы - эксперт по истории России. Ваша задача - предоставлять подробную информацию об исторических событиях. Отвечайте на русском языке.",
+              },
+              {
+                role: "user",
+                content: `Предоставьте подробную историческую справку о событии "${event.title}" (${event.year} год). Включите контекст эпохи, причины и последствия события.`,
+              },
+            ],
+            stream: true,
+          }),
+        }
+      );
+
+      handleStreamResponse(response);
+    } catch (err) {
+      console.error("Ошибка при получении исторической справки:", err);
+      setError("Не удалось получить историческую справку");
+    }
+  };
+
+  const handleAiSearch = async () => {
+    if (!searchQuery.trim()) return;
+
+    setIsSearching(true);
+    setAiSearchResults(null);
+
+    try {
+      const response = await fetch(
+        "/integrations/anthropic-claude-sonnet-3-5/",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: [
+              {
+                role: "system",
+                content:
+                  "Вы - эксперт по истории России. Ваша задача - помочь найти информацию об исторических событиях, даже если их нет в базе данных. Отвечайте на русском языке.",
+              },
+              {
+                role: "user",
+                content: `Найдите информацию об исторических событиях, связанных с запросом: "${searchQuery}". Если это конкретное событие, укажите его дату, место и краткое описание. Если это общий запрос, перечислите несколько связанных исторических событий.`,
+              },
+            ],
+            stream: true,
+          }),
+        }
+      );
+
+      handleStreamResponse(response);
+    } catch (err) {
+      console.error("Ошибка при поиске:", err);
+      setError("Не удалось выполнить поиск");
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  const SubscribeModal = () => (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+      <div className="bg-gray-800 p-8 rounded-2xl max-w-md w-full mx-4">
+        <h2 className="text-2xl font-bold text-blue-400 mb-4">
+          Премиум доступ
+        </h2>
+        <p className="text-gray-300 mb-6">
+          Получите доступ к интерактивной карте и расширенным возможностям:
+        </p>
+        <ul className="text-gray-300 mb-6 space-y-2">
+          <li>
+            <i className="fas fa-check text-green-500 mr-2"></i>Интерактивная
+            карта событий
+          </li>
+          <li>
+            <i className="fas fa-check text-green-500 mr-2"></i>Подробные
+            исторические справки
+          </li>
+          <li>
+            <i className="fas fa-check text-green-500 mr-2"></i>Без рекламы
+          </li>
+        </ul>
+        <div className="flex justify-end gap-4">
+          <button
+            className="px-4 py-2 text-gray-400 hover:text-gray-300"
+            onClick={() => setShowSubscribeModal(false)}
+          >
+            Отмена
+          </button>
+          <button
+            className="px-6 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:opacity-50"
+            onClick={handleSubscribe}
+            disabled={isProcessing}
+          >
+            {isProcessing ? "Обработка..." : "Подписаться"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <div className="text-2xl font-bold">Загрузка...</div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <div className="text-red-500 text-xl">{error}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-gray-900 to-gray-800 text-white p-4">
+      {!subscription?.status === "active" && (
+        <div className="bg-gray-800 p-4 rounded-xl mb-6 text-center">
+          <p className="text-gray-400">Место для рекламы</p>
+        </div>
+      )}
+
+      <div className="absolute top-0 left-0 w-full h-full overflow-hidden pointer-events-none">
+        <div className="absolute top-0 left-0 w-1/3 h-1/3 bg-blue-500 rounded-full filter blur-[150px] opacity-10"></div>
+        <div className="absolute bottom-0 right-0 w-1/2 h-1/2 bg-purple-500 rounded-full filter blur-[150px] opacity-10"></div>
+      </div>
+
+      <div className="relative z-10">
+        <h1 className="text-5xl font-bold text-center mb-2 bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-400">
+          Исторический атлас России
+        </h1>
+        <p className="text-center text-gray-400 mb-8 text-lg">
+          Исследуйте важнейшие события истории России через века
+        </p>
+
+        <div className="mb-6 space-y-4">
+          <div className="flex justify-center gap-2">
+            <div className="relative w-full max-w-2xl">
+              <input
+                type="text"
+                placeholder="Поиск исторических событий..."
+                className="w-full p-3 pl-10 rounded-lg bg-gray-800 border border-gray-700 text-gray-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-500 transition-all"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyPress={(e) => {
+                  if (e.key === "Enter") {
+                    handleAiSearch();
+                  }
+                }}
+              />
+              <span className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400">
+                <i className="fas fa-search"></i>
+              </span>
+            </div>
+            <button
+              onClick={handleAiSearch}
+              disabled={isSearching}
+              className="px-6 py-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:opacity-50 transition-colors"
+            >
+              {isSearching ? (
+                <span>
+                  <i className="fas fa-spinner fa-spin mr-2"></i>
+                  Поиск...
+                </span>
+              ) : (
+                "Искать с ИИ"
+              )}
+            </button>
+          </div>
+
+          <div className="flex flex-wrap gap-4 justify-center">
+            <select
+              className="p-3 rounded-lg bg-gray-800 border border-gray-700 text-gray-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-500 transition-all"
+              value={selectedPeriod || ""}
+              onChange={(e) => setSelectedPeriod(e.target.value || null)}
+            >
+              <option value="">Все периоды</option>
+              {periods.map((period) => (
+                <option
+                  key={period.id}
+                  value={`${period.start_year}-${period.end_year}`}
+                >
+                  {period.name} ({period.start_year}-{period.end_year})
+                </option>
+              ))}
+            </select>
+
+            <select
+              className="p-3 rounded-lg bg-gray-800 border border-gray-700 text-gray-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-500 transition-all"
+              value={selectedCategory || ""}
+              onChange={(e) => setSelectedCategory(e.target.value || null)}
+            >
+              <option value="">Все категории</option>
+              <option value="Города">Города</option>
+              <option value="Сражения">Сражения</option>
+              <option value="События">События</option>
+              <option value="Культура">Культура</option>
+              <option value="Наука">Наука</option>
+              <option value="Политика">Политика</option>
+              <option value="Экономика">Экономика</option>
+              <option value="Религия">Религия</option>
+              <option value="Архитектура">Архитектура</option>
+              <option value="Искусство">Искусство</option>
+              <option value="Технологии">Технологии</option>
+              <option value="Образование">Образование</option>
+              <option value="Спорт">Спорт</option>
+              <option value="Медицина">Медицина</option>
+              <option value="Военное дело">Военное дело</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="space-y-8">
+          {(streamingResponse || aiResponse) && (
+            <div className="bg-gray-800 rounded-2xl shadow-2xl p-6 border border-gray-700">
+              <h2 className="text-2xl font-semibold mb-4 text-blue-400">
+                Результаты поиска
+              </h2>
+              <div className="prose prose-invert max-w-none text-gray-300">
+                {streamingResponse || aiResponse}
+              </div>
+            </div>
+          )}
+
+          <div className="bg-gray-800 rounded-2xl shadow-2xl p-6 border border-gray-700">
+            <h2 className="text-2xl font-semibold mb-4 text-blue-400">
+              События из базы данных
+              {events.length > 0 && (
+                <span className="text-sm ml-2">({events.length})</span>
+              )}
+            </h2>
+            <div className="space-y-4">
+              {events.length === 0 ? (
+                <div className="text-center text-gray-400 py-8">
+                  Не найдено событий по заданным критериям
+                </div>
+              ) : (
+                events.map((event) => (
+                  <div
+                    key={event.id}
+                    className={`border border-gray-700 rounded-xl p-4 hover:bg-gray-700 cursor-pointer transition-all transform hover:scale-[1.02] ${
+                      selectedEvent?.id === event.id
+                        ? "bg-gray-700 border-blue-500"
+                        : ""
+                    }`}
+                    onClick={() => {
+                      setSelectedEvent(event);
+                      getHistoricalInfo(event);
+                    }}
+                  >
+                    <div className="flex justify-between items-start mb-2">
+                      <h3 className="text-xl font-semibold text-blue-400">
+                        {event.title}
+                      </h3>
+                      <span className="text-gray-400">{event.year} год</span>
+                    </div>
+                    <p className="text-gray-400 mb-3">{event.description}</p>
+                    <div className="flex gap-2">
+                      <span className="bg-blue-500 bg-opacity-20 text-blue-400 px-3 py-1 rounded-full text-sm">
+                        {event.category}
+                      </span>
+                      <span className="bg-purple-500 bg-opacity-20 text-purple-400 px-3 py-1 rounded-full text-sm">
+                        Важность: {event.importance}
+                      </span>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+
+        {!subscription?.status === "active" && (
+          <div className="bg-gray-800 p-4 rounded-xl mt-6 text-center">
+            <p className="text-gray-400">Место для рекламы</p>
+          </div>
+        )}
+
+        {(streamingResponse || aiResponse) && (
+          <div className="mt-8 bg-gray-800 rounded-2xl shadow-2xl p-6 border border-gray-700">
+            <h2 className="text-2xl font-semibold mb-4 text-blue-400">
+              Историческая справка
+            </h2>
+            <div className="prose prose-invert max-w-none text-gray-300">
+              {streamingResponse || aiResponse}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {showSubscribeModal && <SubscribeModal />}
+
+      <style jsx global>{`
+        .custom-scrollbar::-webkit-scrollbar {
+          width: 8px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+          background: rgba(31, 41, 55, 0.5);
+          border-radius: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+          background: rgba(59, 130, 246, 0.5);
+          border-radius: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+          background: rgba(59, 130, 246, 0.7);
+        }
+      `}</style>
+    </div>
+  );
+}
+
+export default MainComponent;
