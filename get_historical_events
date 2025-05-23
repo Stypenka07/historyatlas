@@ -1,0 +1,34 @@
+async function handler({ period, category, search }) {
+  let queryText = "SELECT * FROM historical_events WHERE 1=1";
+  const values = [];
+  let paramCount = 1;
+
+  if (period) {
+    const [startYear, endYear] = period.split("-").map(Number);
+    if (!isNaN(startYear) && !isNaN(endYear)) {
+      queryText += ` AND year >= $${paramCount} AND year <= $${paramCount + 1}`;
+      values.push(startYear, endYear);
+      paramCount += 2;
+    }
+  }
+
+  if (category) {
+    queryText += ` AND category = $${paramCount}`;
+    values.push(category);
+    paramCount += 1;
+  }
+
+  if (search) {
+    queryText += ` AND (
+      LOWER(title) LIKE LOWER($${paramCount}) OR
+      LOWER(description) LIKE LOWER($${paramCount})
+    )`;
+    values.push(`%${search}%`);
+    paramCount += 1;
+  }
+
+  queryText += " ORDER BY year ASC";
+
+  const events = await sql(queryText, values);
+  return { events };
+}
