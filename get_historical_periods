@@ -1,0 +1,9 @@
+async function handler() {
+  const periods = await sql`
+    SELECT * 
+    FROM historical_periods 
+    ORDER BY start_year ASC
+  `;
+
+  return { periods };
+}
